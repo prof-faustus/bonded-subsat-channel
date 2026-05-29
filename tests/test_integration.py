@@ -57,10 +57,11 @@ from channel.watchtower.tower import Tower  # noqa: E402
 #
 # The Part I channel construction models the funding tx with a placeholder
 # parent input. For integration, we don't need to spend a wallet UTXO into
-# the channel funding — we directly install the funding outputs in the
-# node's UTXO set, which is equivalent for the integration property: every
-# spend out of the channel (state tx, coop close, bond forfeit) is then
-# verified by the embedded node's mempool through the interpreter.
+# the channel funding. Two helpers below: the direct-install helper is
+# retained for the second-channel contested-close (so the integration
+# test exercises both paths), and a wallet-funded helper that closes
+# decision D11 — the channel's funding tx is a real wallet-spending tx
+# admitted through the embedded node's mempool.
 def _install_channel_in_node(node: EmbeddedNode, ch: Channel) -> None:
     txid = ch.funding_txid()
     for i, out in enumerate(ch.funding_tx.outputs):
@@ -75,6 +76,27 @@ def _fresh_channel(seed: int, n: int = 3, k: int = 1000, S: int = 1,
     cfg = ChannelConfig.uniform_bond(n=n, k=k, S=S, bond=bond)
     book = KeyBook.from_ints(list(range(seed, seed + n)))
     ch = Channel.open(cfg, book)
+    ch.mark_confirmed()
+    return ch
+
+
+def _wallet_funded_channel(node: EmbeddedNode, view, recv_priv,
+                            change_pubkey, cfg, book) -> Channel:
+    """Build a wallet-funded channel: funding tx is admitted via mempool, mined."""
+    from channel.wallet.builder import build_channel_funding_tx, select_utxos
+    from bitcoinx import Script, TxOutput
+    target = cfg.S + sum(cfg.bonds) + 5_000  # headroom for fee
+    selected = select_utxos(view.refresh(), target)
+    keyed = [(u, recv_priv) for u in selected]
+    funding_tx = build_channel_funding_tx(keyed, cfg, book, change_pubkey)
+    result = node.submit_tx(funding_tx)
+    if not result.ok:
+        raise RuntimeError(f"funding tx rejected by mempool: {result.reason}")
+    # Mine the funding tx so its outputs become spendable.
+    miner = recv_priv
+    node.generate_block(p2pkh_script(miner.public_key))
+    parent_utxos = [TxOutput(u.value, Script(u.script_pubkey)) for u in selected]
+    ch = Channel.from_funding_tx(cfg, book, funding_tx, parent_utxos)
     ch.mark_confirmed()
     return ch
 
@@ -118,6 +140,7 @@ def test_phase12_full_system_integration(capsys: pytest.CaptureFixture) -> None:
             wallet_mgr = WalletManager.fresh(hd, view)
             recv_pk = wallet_mgr.new_receive_address(0, 0)
             change_pk = wallet_mgr.new_receive_address(0, 1)
+            recv_priv = hd.derive(0, 0)
 
             # 3. fund the wallet
             node.generate_block(p2pkh_script(recv_pk))
@@ -125,12 +148,15 @@ def test_phase12_full_system_integration(capsys: pytest.CaptureFixture) -> None:
             log(f"[3] wallet funded; balance = {balance} satoshis at h={node.height()}")
             assert balance == node.coinbase_reward
 
-            # 4. open channel 1
-            ch1 = _fresh_channel(seed=90_000, n=4, k=10_000, S=1, bond=1)
-            _install_channel_in_node(node, ch1)
+            # 4. open channel 1 — wallet-funded path (D11)
+            cfg1 = ChannelConfig.uniform_bond(n=4, k=10_000, S=1, bond=1)
+            book1 = KeyBook.from_ints(list(range(90_000, 90_000 + 4)))
+            ch1 = _wallet_funded_channel(node, view, recv_priv, change_pk,
+                                          cfg1, book1)
             cid1 = mgr.add(ch1)
             log(f"[4] opened channel 1 ({ch1.cfg.n} parties, k={ch1.cfg.k}, "
-                f"S={ch1.cfg.S}); cid={cid1[:8].hex()}...")
+                f"S={ch1.cfg.S}) — funded by wallet through mempool; "
+                f"cid={cid1[:8].hex()}...")
 
             # 5. 250 micro-unit transfers
             import random
@@ -162,14 +188,19 @@ def test_phase12_full_system_integration(capsys: pytest.CaptureFixture) -> None:
             log(f"[6] routed payment over {path.length()} hops; "
                 f"every hop settled (secret revealed)")
 
-            # 7. cooperative close of channel 1
+            # 7. cooperative close of channel 1 — admitted through the
+            #    embedded node's mempool (D11: the close spends the real
+            #    funding outputs the wallet put on-chain in step 4).
             close_tx, close_utxos = mgr.cooperative_close(cid1)
             verify_all_inputs(close_tx, close_utxos)
             settled = sum(o.value for o in close_tx.outputs)
             expected = ch1.cfg.S + sum(ch1.cfg.bonds)
-            log(f"[7] cooperative close of channel 1; settled {settled} sat "
-                f"(expected {expected})")
             assert settled == expected
+            close_admit = node.submit_tx(close_tx)
+            assert close_admit.ok, close_admit.reason
+            node.generate_block(p2pkh_script(recv_pk))
+            log(f"[7] cooperative close of channel 1 — admitted to mempool & "
+                f"mined; settled {settled} sat (expected {expected})")
 
             # 8. contested close defended by watchtower
             ch2 = _fresh_channel(seed=92_000, n=3, k=1000, S=1, bond=1)

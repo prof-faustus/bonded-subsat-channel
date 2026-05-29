@@ -96,28 +96,41 @@ valid but too large to mine cheaply on regtest in CI). At-scale on-chain
 funding signature verification is exercised at n=200 in
 `test_scale_slow_on_chain_n_of_n_funding_signature`.
 
-## D11. Phase 12 channel funding installs UTXOs directly (audit G5)
+## D11. Wallet-funded channel open — CLOSED (was a residual; now implemented)
 
-The Phase 12 integration test's `_install_channel_in_node` helper
-inserts the channel's funding outputs (the n-of-n channel output and
-the n bond outputs) directly into the embedded node's UTXO store,
-bypassing the construction of a parent-spending funding transaction
-out of the wallet's coinbase UTXOs.
+**Status: closed.** Earlier revisions of this implementation installed
+the channel's funding outputs (the n-of-n channel output and the n
+bond outputs) directly into the embedded node's UTXO store via a test
+helper, because `Channel.open` modelled the funding transaction with a
+placeholder OP_TRUE parent. The audit flagged this as a soundness-
+adjacent scope note.
 
-**Why:** the Part I channel construction (`lifecycle.Channel.open`)
-models the funding transaction with a placeholder OP_TRUE parent
-input (its prev_hash and prev_idx are zeros). Wiring a real
-wallet-funded parent would require a second transaction class with
-full SIGHASH machinery wrapped around the channel construction, which
-is out of scope for the paper's contribution. The property the
-integration test demonstrates — every spend out of the channel
-(state, close, forfeit) verifies through the interpreter against the
-node's UTXO set — is unchanged by this scoping choice.
+It is no longer a scope note. The wallet builder now constructs a real
+funding-spend transaction:
 
-**How to apply:** the spec asks for end-to-end conservation and
-interpreter-verified spends; both hold under the current modelling.
-A wallet-funded-parent extension is a future Part II refinement and
-does not invalidate the present construction.
+- `wallet.builder.build_channel_funding_tx` selects wallet UTXOs,
+  builds a transaction whose inputs are P2PKH spends of those UTXOs
+  and whose outputs are the canonical channel-funding output vector
+  (n-of-n channel CMS + n bond outputs), signs every input, and
+  returns the tx.
+- The wallet submits it to the embedded node's mempool. Every input
+  is validated through the real Bitcoin Script interpreter via
+  `channel.verify.verify_spend` — the same code path as any other
+  transaction. The funding tx is then mined.
+- `Channel.from_funding_tx(cfg, keybook, funding_tx, parent_utxos)`
+  wraps the confirmed funding tx so the channel layer's state /
+  close / forfeit transactions reference the real funding txid.
+- The Phase 12 integration test uses this wallet-funded path for its
+  primary channel. The cooperative close tx is admitted to the
+  mempool and mined; the funding outputs are spent and the per-party
+  payouts settle on-chain.
+
+The standalone `Channel.open` (placeholder OP_TRUE parent) is retained
+for unit tests that exercise the channel layer in isolation, without
+needing a wallet.
+
+**Tests:** `tests/test_wallet_funded_channel.py` (wallet-funded
+open + close round-trip) and the upgraded Phase 12 integration test.
 
 ## D12. Scale-test scope claims (audit G6)
 
@@ -158,26 +171,48 @@ interactive wallet-unlock.
 hardened AEAD (e.g. AES-GCM via `cryptography`) should preserve at
 least the same KDF cost factor.
 
-## D14. Watchtower incentive: accounting placeholder (audit G8)
+## D14. Script-enforced watchtower incentive — CLOSED (was a residual; now implemented)
 
-`watchtower/incentive.py` is an accounting placeholder that records
-the satoshi fee credited per intervention; it does **not**
-script-enforce that the tower's payment is claimable only on a
-forfeiture-branch spend.
+**Status: closed.** Earlier revisions left the tower's payment as an
+off-chain accounting ledger in `watchtower/incentive.py`. The audit
+flagged this as failing the §17 promise that the tower "profits only
+by acting correctly and cannot profit by collusion or by inaction."
 
-**Why:** a script-enforced tower payment is a meaningful design
-extension. It would either (a) thread a tower pubkey into the bond's
-ELSE branch so the forfeiture transaction must pay the tower its
-fee, or (b) add a separate tower-bond output co-signed at channel
-open and claimable by the tower only after broadcasting a
-current-state tx that overtakes a stale one. Both are several
-hundred lines of additional script + integration-test code and
-exceed the paper's narrow scope, which is the bonded sub-satoshi
-channel itself.
+It is no longer a placeholder. The tower's payment is now
+**script-enforced** through SIGHASH commitment on the forfeit
+transaction:
 
-**How to apply:** the tower's incentive-compatibility, in the
-current implementation, is an off-chain accounting commitment
-between the channel parties and the tower. The scoped claim in the
-paper is the construction's non-reliance on the tower for
-**soundness** (the custody-free property of D9). Incentive-
-compatibility of the tower itself is left as future work.
+- `lifecycle.Channel.forfeit_bond_tx` accepts optional `tower_pubkey`
+  and `tower_fee` arguments. When set, the forfeit transaction
+  carries a P2PKH output (at index 0) paying `tower_fee` satoshis to
+  the tower's pubkey, with the bond remainder split among the honest
+  counterparties as before.
+- The honest counterparties sign the forfeit branch with
+  `SIGHASH_ALL | FORKID`. This commits the multisig signatures to
+  every output of the transaction — including the tower-fee output.
+- The tower can therefore broadcast the forfeit **only verbatim**.
+  Any modification (omitting the tower output, redirecting it to a
+  different pubkey, changing its value, reordering outputs) breaks
+  the SIGHASH digest and the `OP_CHECKMULTISIG` check fails inside
+  the interpreter. The tampered tx is rejected by every node.
+
+Property statement (proved by interpreter execution):
+
+- **By acting correctly:** the tower broadcasts the pre-signed
+  forfeit; it mines; the tower's pubkey receives `tower_fee` sat as
+  a new UTXO. Confirmed by
+  `test_tower_incentive_only_collected_on_intervention`.
+- **By inaction:** no broadcast → no UTXO ever lands at the tower's
+  pubkey. Confirmed by `test_tower_no_intervention_no_fee`.
+- **By collusion or tampering:** any tampered variant is VM-rejected.
+  Confirmed by `test_tower_cannot_redirect_fee_to_itself_under_sighash_all`
+  and `test_tower_cannot_omit_fee_output_under_sighash_all`.
+
+The tower remains custody-free: it never signs any tx itself; it only
+broadcasts what the counterparties pre-signed.
+
+`watchtower/incentive.py` is retained as a local ledger that records
+the off-chain bookkeeping of fees earned (for status reporting), but
+the *enforcement* is on-chain, on the spend, through the interpreter.
+
+**Tests:** six tests in `tests/test_watchtower.py` (D14 cluster).

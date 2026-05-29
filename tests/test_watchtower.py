@@ -199,3 +199,185 @@ def test_monitor_idempotent_start_and_stop() -> None:
     mon.stop()
     mon.stop()  # safe to stop again
     assert not mon.is_running()
+
+
+# ---------------------------------------------------------------------------
+# D14 — Script-enforced tower payment
+# ---------------------------------------------------------------------------
+
+
+def test_tower_fee_paid_in_pre_signed_forfeit_verifies_through_VM() -> None:
+    """The pre-signed forfeit pays the tower its fee; spend verifies."""
+    node = EmbeddedNode()
+    ch = _fresh_channel(n=3, k=1000, S=1, bond=2)  # bond=2 so fee+share>0
+    _seed_funding_into_node(node, ch)
+    ch.apply_transfer(0, 1, 300)
+
+    tower_priv = PrivateKey((77_777).to_bytes(32, "big"))
+    tower_fee = 1  # 1 satoshi to the tower
+
+    # Counterparties pre-sign the forfeit transaction that pays the tower.
+    forfeit_tx, forfeit_utxos = ch.forfeit_bond_tx(
+        offender=0,
+        tower_pubkey=tower_priv.public_key,
+        tower_fee=tower_fee,
+    )
+    # The spend verifies through the interpreter — the counterparty
+    # signatures match the output set including the tower-fee output.
+    from channel.verify import verify_spend
+    assert verify_spend(forfeit_tx, 0, forfeit_utxos[0])
+
+    # The first output is the tower-fee output, paying the tower's pubkey.
+    from channel.scripts import p2pkh_script
+    expected_script = bytes(p2pkh_script(tower_priv.public_key))
+    assert forfeit_tx.outputs[0].value == tower_fee
+    assert bytes(forfeit_tx.outputs[0].script_pubkey) == expected_script
+
+
+def test_tower_cannot_redirect_fee_to_itself_under_sighash_all() -> None:
+    """G8/D14 — tampering with the tower output invalidates the multisig.
+
+    Constructs a pre-signed forfeit paying the tower its fee, then a
+    tampered variant that redirects the tower-fee output to a different
+    pubkey. The tampered variant must be **rejected by the interpreter**,
+    not by any Python guard. This is what makes the incentive
+    script-enforced: the tower has no way to profitably modify the
+    transaction; its only profitable action is broadcasting the
+    pre-signed forfeit verbatim.
+    """
+    node = EmbeddedNode()
+    ch = _fresh_channel(n=3, k=1000, S=1, bond=2)
+    _seed_funding_into_node(node, ch)
+
+    tower_priv = PrivateKey((77_778).to_bytes(32, "big"))
+    attacker_priv = PrivateKey((88_888).to_bytes(32, "big"))
+    tower_fee = 1
+
+    forfeit_tx, forfeit_utxos = ch.forfeit_bond_tx(
+        offender=0,
+        tower_pubkey=tower_priv.public_key,
+        tower_fee=tower_fee,
+    )
+    # Original verifies.
+    from channel.verify import verify_spend, spend_verifies
+    assert verify_spend(forfeit_tx, 0, forfeit_utxos[0])
+
+    # Tamper: keep the same multisig script_sig (so the counterparties'
+    # signatures are unchanged) but swap the tower-fee output to pay an
+    # attacker-controlled pubkey. SIGHASH_ALL must catch this.
+    from bitcoinx import Tx, TxOutput
+    from channel.scripts import p2pkh_script
+    tampered = Tx(
+        forfeit_tx.version,
+        list(forfeit_tx.inputs),
+        # First output (tower fee) redirected to the attacker.
+        [TxOutput(tower_fee, p2pkh_script(attacker_priv.public_key))]
+        + list(forfeit_tx.outputs[1:]),
+        forfeit_tx.locktime,
+    )
+    assert not spend_verifies(tampered, 0, forfeit_utxos[0])
+
+
+def test_tower_cannot_omit_fee_output_under_sighash_all() -> None:
+    """A tampered forfeit that omits the tower-fee output is VM-rejected."""
+    node = EmbeddedNode()
+    ch = _fresh_channel(n=3, k=1000, S=1, bond=2)
+    _seed_funding_into_node(node, ch)
+
+    tower_priv = PrivateKey((77_779).to_bytes(32, "big"))
+    tower_fee = 1
+
+    forfeit_tx, forfeit_utxos = ch.forfeit_bond_tx(
+        offender=0,
+        tower_pubkey=tower_priv.public_key,
+        tower_fee=tower_fee,
+    )
+
+    from bitcoinx import Tx
+    tampered = Tx(
+        forfeit_tx.version,
+        list(forfeit_tx.inputs),
+        list(forfeit_tx.outputs[1:]),  # drop the tower-fee output
+        forfeit_tx.locktime,
+    )
+    from channel.verify import spend_verifies
+    assert not spend_verifies(tampered, 0, forfeit_utxos[0])
+
+
+def test_tower_no_fee_path_still_supported() -> None:
+    """Backwards compatibility: forfeit_bond_tx without a tower works as before."""
+    node = EmbeddedNode()
+    ch = _fresh_channel(n=3, k=1000, S=1, bond=1)
+    _seed_funding_into_node(node, ch)
+    forfeit_tx, forfeit_utxos = ch.forfeit_bond_tx(offender=0)
+    from channel.verify import verify_spend
+    assert verify_spend(forfeit_tx, 0, forfeit_utxos[0])
+
+
+def test_tower_incentive_only_collected_on_intervention() -> None:
+    """End-to-end: tower's fee lands as a UTXO only after the forfeit is mined.
+
+    Scenario:
+    1. Tower is registered with a pre-signed forfeit that pays it.
+    2. The offender broadcasts a stale state.
+    3. The tower overtakes the stale state and submits the forfeit.
+    4. The block is mined. The tower's pubkey now has a UTXO equal to
+       the fee.
+    5. Counter-scenario: a separate tower that registers but never
+       intervenes accumulates no UTXOs.
+    """
+    from channel.scripts import p2pkh_script
+    node = EmbeddedNode()
+    ch = _fresh_channel(n=3, k=1000, S=1, bond=2)
+    _seed_funding_into_node(node, ch)
+    ch.apply_transfer(0, 1, 400)
+    current_tx, _ = ch.sign_state_tx(ch.state)
+
+    tower_priv = PrivateKey((77_780).to_bytes(32, "big"))
+    tower_pk = tower_priv.public_key
+    tower_fee_sat = 1
+    forfeit_tx, _ = ch.forfeit_bond_tx(
+        offender=0, tower_pubkey=tower_pk, tower_fee=tower_fee_sat,
+    )
+
+    reg = Registry()
+    tower = Tower(node=node, registry=reg, tower_pubkey=tower_pk)
+    tower.register(WatchRecord(
+        channel_id=ch.funding_txid(),
+        current_state_tx_hex=current_tx.to_hex(),
+        forfeit_tx_hex_by_owner={0: forfeit_tx.to_hex()},
+        horizon=ch.cfg.L0,
+    ))
+
+    # Offender's stale broadcast.
+    stale_tx, _ = ch.superseded_state_tx_for(0, (1000, 0, 0))
+    assert node.submit_tx(stale_tx).ok
+    assert tower.interventions == 1
+
+    # The tower then submits the pre-signed forfeit.
+    assert tower.forfeit_offender_bond(ch.funding_txid(), 0).ok
+
+    # Mine the mempool — the tower's payout becomes a UTXO.
+    miner_priv = PrivateKey.from_random()
+    node.generate_block(p2pkh_script(miner_priv.public_key))
+
+    tower_script_bytes = bytes(p2pkh_script(tower_pk))
+    tower_utxos = node.blockstore.utxos_for_script(tower_script_bytes)
+    assert len(tower_utxos) == 1
+    assert tower_utxos[0].value == tower_fee_sat
+
+
+def test_tower_no_intervention_no_fee() -> None:
+    """A passive tower (registered, never intervenes) holds zero UTXOs."""
+    from channel.scripts import p2pkh_script
+    node = EmbeddedNode()
+    tower_priv = PrivateKey((77_790).to_bytes(32, "big"))
+    tower = Tower(node=node, registry=Registry(),
+                   tower_pubkey=tower_priv.public_key)
+    # Mine some unrelated blocks; the tower never sees a stale state.
+    other_priv = PrivateKey.from_random()
+    node.generate_block(p2pkh_script(other_priv.public_key))
+    node.generate_block(p2pkh_script(other_priv.public_key))
+    assert tower.interventions == 0
+    tower_script_bytes = bytes(p2pkh_script(tower_priv.public_key))
+    assert node.blockstore.utxos_for_script(tower_script_bytes) == []

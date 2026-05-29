@@ -13,9 +13,15 @@ claim/return); the wallet's role is funding and ordinary payments.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Sequence, TYPE_CHECKING
 
 from bitcoinx import PrivateKey, PublicKey, Script, Tx, TxInput, TxOutput
+
+if TYPE_CHECKING:
+    # Only imported during type-checking to avoid the wallet/lifecycle
+    # import cycle at runtime.
+    from ..config import ChannelConfig
+    from ..keymgmt import KeyBook
 
 from ..accounting import ensure_whole_satoshi
 from ..config import FINAL_SEQUENCE, SIGHASH_ALL_FORKID
@@ -118,11 +124,91 @@ def build_and_sign_payment(
     return tx
 
 
+# ---------------------------------------------------------------------------
+# D11 — wallet-funded channel funding transaction
+# ---------------------------------------------------------------------------
+
+
+def build_channel_funding_tx(
+    funder_utxos_with_keys: list[tuple[UtxoEntry, PrivateKey]],
+    cfg: "ChannelConfig",  # forward-stringly typed to avoid a circular import
+    keybook: "KeyBook",
+    change_pubkey: PublicKey,
+    fee_per_byte: int = DEFAULT_FEE_PER_BYTE,
+) -> Tx:
+    """Build, sign, and return the channel-funding transaction.
+
+    Inputs are P2PKH spends of the supplied wallet UTXOs. Outputs are
+    the canonical channel-funding output vector (the n-of-n channel
+    output of value ``S`` followed by the n bond outputs), plus a P2PKH
+    change output to ``change_pubkey`` whenever the change exceeds the
+    dust threshold.
+
+    The returned transaction is what the wallet submits to the embedded
+    node's mempool. After it confirms (mined into a block),
+    :meth:`channel.lifecycle.Channel.from_funding_tx` wraps it so the
+    channel layer's state / close / forfeit transactions reference the
+    real funding txid.
+
+    This closes scoping decision D11: the funding tx now spends real
+    wallet UTXOs and is admitted through the same mempool-validation
+    path as any other transaction (every input verified through the
+    Bitcoin Script interpreter via :func:`channel.verify.verify_spend`).
+    """
+    # Local import: avoids the import cycle the channel layer would
+    # introduce if wallet/ imported lifecycle/ at module-load time.
+    from ..lifecycle import build_channel_outputs
+
+    if not funder_utxos_with_keys:
+        raise WalletBuildError("no funding inputs supplied")
+    for u, _k in funder_utxos_with_keys:
+        ensure_whole_satoshi(u.value)
+
+    channel_outputs = build_channel_outputs(cfg, keybook)
+    channel_value = sum(o.value for o in channel_outputs)
+    change_script = p2pkh_script(change_pubkey)
+
+    inputs = [
+        TxInput(u.txid, u.vout, Script(b""), FINAL_SEQUENCE)
+        for u, _k in funder_utxos_with_keys
+    ]
+    # Provisional out_list with a zero-valued change for size estimation.
+    out_list = list(channel_outputs) + [TxOutput(0, change_script)]
+    tx = Tx(1, inputs, out_list, 0)
+    rough_size = tx.size() + 108 * len(inputs)  # P2PKH script_sig ~108 B
+    fee = rough_size * fee_per_byte
+
+    total_in = sum(u.value for u, _k in funder_utxos_with_keys)
+    change = total_in - channel_value - fee
+    if change < 0:
+        raise WalletBuildError(
+            f"funds {total_in} < channel funding {channel_value} + fee {fee}"
+        )
+    if change < DEFAULT_DUST_THRESHOLD:
+        # No change output (the un-output value becomes fee).
+        out_list = list(channel_outputs)
+    else:
+        out_list[-1] = TxOutput(change, change_script)
+    tx = Tx(1, inputs, out_list, 0)
+
+    # Sign each P2PKH input.
+    for i, (u, priv) in enumerate(funder_utxos_with_keys):
+        utxo_script = Script(u.script_pubkey)
+        sig = sign_input(tx, i, u.value, utxo_script, priv, SIGHASH_ALL_FORKID)
+        tx.inputs[i] = TxInput(
+            u.txid, u.vout,
+            p2pkh_unlock(sig, priv.public_key),
+            FINAL_SEQUENCE,
+        )
+    return tx
+
+
 __all__ = [
     "WalletBuildError",
     "FundingOutput",
     "select_utxos",
     "build_and_sign_payment",
+    "build_channel_funding_tx",
     "DEFAULT_FEE_PER_BYTE",
     "DEFAULT_DUST_THRESHOLD",
 ]

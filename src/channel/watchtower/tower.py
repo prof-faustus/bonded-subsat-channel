@@ -9,6 +9,17 @@ broadcasts the pre-signed forfeiture against the offender's bond.
 The tower has no key custody: every transaction it broadcasts was
 pre-signed at registration time. Failure of the tower delays settlement
 but cannot move funds to the tower.
+
+Incentive (D14). The tower has an associated public key
+:attr:`tower_pubkey`. At watch-record registration time, the channel's
+counterparties pre-sign forfeiture transactions that include a fixed
+``tower_fee`` satoshi P2PKH output paying ``tower_pubkey``. The
+``SIGHASH_ALL | FORKID`` commitment on those signatures binds them to
+the exact output structure. The tower can therefore broadcast a
+forfeit **only if it carries the tower-fee output verbatim**. Acting
+correctly: broadcasts the pre-signed tx → receives the fee. Inaction:
+no broadcast → no fee. Collusion / tampering: any modification
+invalidates the multisig and the tx is rejected by the interpreter.
 """
 
 from __future__ import annotations
@@ -17,7 +28,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
-from bitcoinx import Tx
+from bitcoinx import PublicKey, Tx
 
 from ..errors import ChannelError
 from ..node.mempool import Mempool
@@ -35,10 +46,18 @@ class TowerError(ChannelError):
 
 @dataclass
 class Tower:
-    """A watchtower bound to an :class:`EmbeddedNode` and a :class:`Registry`."""
+    """A watchtower bound to an :class:`EmbeddedNode` and a :class:`Registry`.
+
+    Carries the tower's own destination public key for incentive
+    payments. The tower never signs any spend itself — it only
+    broadcasts transactions the channel parties pre-signed — so
+    custody-freedom is preserved; the public key is solely the address
+    at which the pre-signed payments land.
+    """
 
     node: EmbeddedNode
     registry: Registry
+    tower_pubkey: Optional[PublicKey] = None
     interventions: int = 0
     forfeits: int = 0
     on_intervention: Optional[Callable[[bytes, Tx], None]] = None

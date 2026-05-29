@@ -835,10 +835,16 @@ explicit scoping decision recorded in `docs/DECISIONS.md`.
   `transfer`, `close`, `contested`, the missing-state and
   malformed-script error paths, the no-subcommand help path, and the
   global `--log-level` flag.
-- **G5 — Phase 12 funding scoping (closed by decision D11).** The
-  channel funding outputs are installed directly into the node's UTXO
-  set rather than spent in from wallet UTXOs; the spec property is
-  unchanged. See DECISIONS.md D11.
+- **G5 — Wallet-funded channel open (closed by implementation, D11
+  superseded).** The wallet now constructs a real funding-spend
+  transaction (`wallet.builder.build_channel_funding_tx`) whose
+  outputs are the canonical channel + bond outputs, signed P2PKH
+  spends of wallet UTXOs. It is admitted through the embedded node's
+  mempool — every input verified through the interpreter — mined, and
+  wrapped by `Channel.from_funding_tx`. The Phase 12 integration test
+  uses this path. The standalone `Channel.open` with an OP_TRUE
+  placeholder parent is retained only for unit tests of the channel
+  layer in isolation. See DECISIONS.md D11.
 - **G6 — Scale-test scope claims (closed by decision D12).** Three
   scale tests at three precise fidelity levels; the paper's scale
   claim is restated as: VM-verified to n = 200,
@@ -848,11 +854,17 @@ explicit scoping decision recorded in `docs/DECISIONS.md`.
   DER-valid signature from a non-participant key (rather than a zero
   placeholder) and asserts the interpreter rejects on the wrong-key
   ground rather than the malformed-signature ground.
-- **G8 — Watchtower incentive placeholder (closed by decision D14).**
-  The tower's incentive-compatibility is an off-chain accounting
-  commitment in the current implementation. The scoped paper claim is
-  the tower's non-reliance for *soundness* (custody-free, D9); a
-  script-enforced tower payment is a future Part II refinement. See
+- **G8 — Script-enforced watchtower incentive (closed by
+  implementation, D14 superseded).** The tower's payment is now a
+  P2PKH output baked into the forfeit transaction the honest
+  counterparties pre-sign with `SIGHASH_ALL | FORKID`. The SIGHASH
+  commitment binds the multisig signatures to every output of the
+  forfeit transaction, including the tower-fee output. The tower can
+  only broadcast the forfeit verbatim; any tampering (omitting the
+  fee, redirecting it, reordering) breaks the digest and the
+  `OP_CHECKMULTISIG` check fails inside the interpreter. The §17
+  property — "profits only by acting correctly, gains nothing from
+  inaction or collusion" — is proved by interpreter execution. See
   DECISIONS.md D14.
 - **G9 — KDF cost factor (closed by extension + decision D13).**
   PBKDF2-HMAC-SHA256 iteration count raised from 200 000 to 600 000 to
@@ -863,7 +875,12 @@ explicit scoping decision recorded in `docs/DECISIONS.md`.
   `docs/PHASE12_TRANSCRIPT.txt` on every run, independent of `pytest
   -s`.
 
-The residuals after this pass are exactly the two documented design
-decisions (D11 wallet-funded parent and D14 script-enforced tower
-payment). Neither invalidates the construction; both are scoped
-extensions for future work.
+After a follow-up gap-closure pass D11 and D14 were both implemented
+in full (closed by code + tests, not by documentation). There are
+**no residual gaps** between the spec and the implementation. The
+construction's soundness rests on the same three pillars as in §6 —
+signature unforgeability, one-wayness of `HASH160`, and the
+consensus single-spend / supersession rules — augmented in the
+implementation by the SIGHASH commitment that locks every multisig
+spend (channel close, bond return, bond forfeit) to the exact
+output structure it was signed for.

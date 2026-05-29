@@ -41,6 +41,8 @@ from .bond import (
     sign_bond_forfeit,
     sign_bond_return,
 )
+# Note: make_bond_script_for is also imported by build_channel_outputs
+# below; keep this import block tidy.
 from .config import (
     ChannelConfig,
     COOP_LOCKTIME,
@@ -92,6 +94,30 @@ def sequence_for_version(version: int) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Funding transaction outputs (shared between standalone and wallet-funded)
+# ---------------------------------------------------------------------------
+
+
+def build_channel_outputs(cfg: "ChannelConfig", keybook: "KeyBook",
+                           ) -> list[TxOutput]:
+    """Return the canonical output vector for a channel funding tx.
+
+    Output 0 is the n-of-n channel CMS output of value ``S``; outputs
+    1..n are the per-participant bond outputs of value ``b_i``. Used by
+    both :meth:`Channel.open` (standalone placeholder parent) and the
+    wallet's funding-tx builder (real wallet-UTXO parent).
+    """
+    if keybook.n != cfg.n:
+        raise StateError(f"keybook size {keybook.n} != cfg.n {cfg.n}")
+    pubs = keybook.public_keys()
+    outs: list[TxOutput] = [TxOutput(cfg.S, channel_funding_script(pubs))]
+    for i in range(cfg.n):
+        cp = [pubs[j] for j in range(cfg.n) if j != i]
+        outs.append(TxOutput(cfg.bonds[i], make_bond_script_for(pubs[i], cp)))
+    return outs
+
+
+# ---------------------------------------------------------------------------
 # Funding transaction
 # ---------------------------------------------------------------------------
 
@@ -122,50 +148,70 @@ class Channel:
              parent_value: int | None = None) -> "Channel":
         """Construct a fresh channel via a funding transaction.
 
-        The funding transaction's inputs are modelled as one parent input
-        whose value matches the total satoshis locked under the channel
-        output and bonds combined. This is sufficient for the reference
-        implementation — we are not on a live network.
-
-        Parameters
-        ----------
-        cfg
-            Channel configuration.
-        keybook
-            Participant key book (size must equal ``cfg.n``).
-        parent_outpoint
-            ``(prev_hash, prev_idx)`` of the funding input. Defaults to a
-            zero/0 placeholder (we do not chain to a real coinbase).
-        parent_value
-            Value of the parent UTXO. Defaults to exactly the funded total.
+        Standalone path: the funding transaction's input is a single
+        placeholder OP_TRUE input. This is sufficient for unit tests and
+        for the channel-layer's own correctness; production funding goes
+        through :meth:`from_funding_tx` after the wallet has built a real
+        UTXO-spending funding transaction (see
+        :func:`channel.wallet.builder.build_channel_funding_tx`).
         """
-        if keybook.n != cfg.n:
-            raise StateError(
-                f"keybook size {keybook.n} != cfg.n {cfg.n}"
-            )
         total = cfg.S + sum(cfg.bonds)
         ensure_whole_satoshi(total)
         if parent_value is None:
             parent_value = total
 
-        # Outputs: channel output (index 0), then bonds 1..n.
-        pubs = keybook.public_keys()
-        channel_locking = channel_funding_script(pubs)
-        outputs: list[TxOutput] = [TxOutput(cfg.S, channel_locking)]
-        bonds: list[BondOutput] = []
-
-        # First we need the txid of the funding tx, so build it tentatively
-        # without bond txid wiring, then patch the bond descriptors.
-        for i in range(cfg.n):
-            cp = [pubs[j] for j in range(cfg.n) if j != i]
-            bond_locking = make_bond_script_for(pubs[i], cp)
-            outputs.append(TxOutput(cfg.bonds[i], bond_locking))
-
+        outputs = build_channel_outputs(cfg, keybook)
         prev_hash, prev_idx = parent_outpoint
         tx_in = TxInput(prev_hash, prev_idx, Script(b""), FINAL_SEQUENCE)
         funding_tx = Tx(1, [tx_in], outputs, 0)
-        funding_txid = funding_tx.hash()
+        funding_utxos = [TxOutput(parent_value, Script() << Ops.OP_TRUE)]
+        return cls._wrap_funding(cfg, keybook, funding_tx, funding_utxos)
 
+    @classmethod
+    def from_funding_tx(cls, cfg: ChannelConfig, keybook: KeyBook,
+                         funding_tx: Tx,
+                         parent_utxos: list[TxOutput]) -> "Channel":
+        """Wrap an externally-built (e.g. wallet-funded) funding transaction.
+
+        The funding transaction must carry the canonical channel-output
+        vector at outputs 0..n: output 0 is the n-of-n channel CMS
+        output of value ``S``, outputs 1..n are the per-participant bond
+        outputs. This invariant is checked.
+
+        ``parent_utxos`` are the UTXOs the wallet spent into the funding
+        tx; they are stored for downstream auditing but are no longer the
+        OP_TRUE placeholder of :meth:`open`.
+        """
+        expected = build_channel_outputs(cfg, keybook)
+        if len(funding_tx.outputs) < 1 + cfg.n:
+            raise StateError(
+                f"funding_tx has {len(funding_tx.outputs)} outputs; "
+                f"need >= {1 + cfg.n}"
+            )
+        for i in range(1 + cfg.n):
+            actual = funding_tx.outputs[i]
+            want = expected[i]
+            if actual.value != want.value:
+                raise StateError(
+                    f"funding_tx.outputs[{i}].value = {actual.value} "
+                    f"!= expected {want.value}"
+                )
+            if bytes(actual.script_pubkey) != bytes(want.script_pubkey):
+                raise StateError(
+                    f"funding_tx.outputs[{i}].script_pubkey mismatch"
+                )
+        return cls._wrap_funding(cfg, keybook, funding_tx, parent_utxos)
+
+    @classmethod
+    def _wrap_funding(cls, cfg: ChannelConfig, keybook: KeyBook,
+                       funding_tx: Tx,
+                       funding_utxos: list[TxOutput]) -> "Channel":
+        """Common tail used by :meth:`open` and :meth:`from_funding_tx`."""
+        if keybook.n != cfg.n:
+            raise StateError(f"keybook size {keybook.n} != cfg.n {cfg.n}")
+        pubs = keybook.public_keys()
+        funding_txid = funding_tx.hash()
+        bonds: list[BondOutput] = []
         for i in range(cfg.n):
             cp = [pubs[j] for j in range(cfg.n) if j != i]
             bond_locking = make_bond_script_for(pubs[i], cp)
@@ -176,9 +222,6 @@ class Channel:
                 vout=1 + i,
                 locking_script=bond_locking,
             ))
-
-        funding_utxos = [TxOutput(parent_value, Script() << Ops.OP_TRUE)]
-
         ch = cls(
             cfg=cfg,
             keybook=keybook,
@@ -375,28 +418,60 @@ class Channel:
             self.state = saved
         return tx, utxos
 
-    def forfeit_bond_tx(self, offender: int) -> tuple[Tx, list[TxOutput]]:
+    def forfeit_bond_tx(self, offender: int,
+                         tower_pubkey: "PublicKey | None" = None,
+                         tower_fee: int = 0,
+                         ) -> tuple[Tx, list[TxOutput]]:
         """Build and co-sign the bond-forfeiture transaction.
 
-        Pays the offender's bond to the honest counterparties pro-rata
-        (by index ordering; the exact split is not protocol-significant).
-        Spends only the offender's bond.
+        Pays the offender's bond:
+        - If ``tower_pubkey`` is given and ``tower_fee > 0``, the first
+          output of the forfeiture transaction is a P2PKH paying the
+          tower ``tower_fee`` satoshis. The remainder goes to the honest
+          counterparties pro-rata.
+        - Otherwise the full bond is split among the honest counterparties
+          (the path used when no watchtower is involved).
+
+        D14 — Script-enforced tower payment. The honest counterparties
+        sign the forfeit branch with ``SIGHASH_ALL | FORKID``, which
+        commits to every output of the transaction. A tower that
+        attempts to broadcast a modified forfeit (e.g. one that omits
+        the tower-fee output or redirects it elsewhere) will fail the
+        ``OP_CHECKMULTISIG`` check because the signatures do not match
+        the tampered output set. The tower therefore profits **only by
+        broadcasting the exact forfeit the counterparties pre-signed**,
+        and gains nothing from inaction (no forfeit broadcast → no fee
+        paid) or from attempted collusion (any tampering invalidates
+        the multisig). This is the property §17 of the spec calls for.
         """
         self._require_confirmed()
         if not 0 <= offender < self.cfg.n:
             raise StateError(f"offender {offender} out of [0, {self.cfg.n})")
+        if tower_fee < 0:
+            raise StateError(f"tower_fee must be >= 0 (got {tower_fee})")
 
         bond = self.bonds[offender]
+        if tower_fee > bond.value:
+            raise StateError(
+                f"tower_fee {tower_fee} exceeds bond value {bond.value}"
+            )
         honest_indices = [i for i in range(self.cfg.n) if i != offender]
 
         tx_in = TxInput(self.funding_txid(), 1 + offender, Script(b""),
                         FINAL_SEQUENCE)
-        # Pay-out: split the bond value into equal-as-possible shares to
-        # the honest counterparties (last takes the rounding remainder).
-        m = len(honest_indices)
-        share = bond.value // m
-        rem = bond.value - share * m
+
         outputs: list[TxOutput] = []
+        # Tower output first (deterministic position): the tower's payee
+        # script is committed-to by the counterparties' SIGHASH_ALL sigs.
+        if tower_pubkey is not None and tower_fee > 0:
+            ensure_whole_satoshi(tower_fee)
+            outputs.append(TxOutput(tower_fee, p2pkh_script(tower_pubkey)))
+
+        # Remainder split among honest counterparties.
+        remaining = bond.value - (tower_fee if tower_pubkey is not None else 0)
+        m = len(honest_indices)
+        share = remaining // m
+        rem = remaining - share * m
         for k, idx in enumerate(honest_indices):
             v = share + (rem if k == m - 1 else 0)
             ensure_whole_satoshi(v)
