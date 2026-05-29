@@ -1,0 +1,1 @@
+"""Embedded BSV HD wallet."""

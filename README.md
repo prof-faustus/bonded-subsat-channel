@@ -1,0 +1,166 @@
+# Bonded Sub-Satoshi Channels (BSV, post-Genesis) — Reference Implementation
+
+This repository is the reference implementation accompanying the paper on
+**bonded sub-satoshi channels** for Bitcoin SV in its post-Genesis form.
+It demonstrates three claims:
+
+1. **Sub-satoshi divisibility under exact whole-satoshi settlement.** A funded
+   satoshi is subdivided off-chain into `k` micro-units; on-chain settlement is
+   always in whole satoshis, reconciled by a deterministic netting rule `Q*`.
+2. **Fixed risked capital of one bonded satoshi per participant.** Risked
+   capital is independent of payment size and path length.
+3. **Economic deterrence by bond forfeiture.** A superseded broadcast forfeits
+   the offender's bond; honest cooperative settlement is the unique rational
+   outcome.
+
+The construction uses only original-protocol primitives that remain meaningful
+on post-Genesis BSV: integer-valued outputs, `nSequence`/`nLockTime`
+transaction finality (the original replacement rule), SIGHASH flags, and
+locking scripts built from `OP_HASH160`, `OP_EQUALVERIFY`, `OP_CHECKSIG`,
+`OP_IF`/`OP_ELSE`/`OP_ENDIF`, and `OP_CHECKMULTISIG`.
+
+Crucially, `OP_CHECKLOCKTIMEVERIFY` and `OP_CHECKSEQUENCEVERIFY` are inert
+no-ops on post-Genesis BSV; this implementation therefore **never** places
+any in-script timelock opcode in any locking script. Timing is enforced
+exclusively at the transaction level by `nLockTime` / `nSequence`.
+
+## Install
+
+Python 3.11+ is required.
+
+```
+pip install -r requirements.txt
+```
+
+`bitcoinx` depends on a native `secp256k1` build. On Debian/Ubuntu install:
+
+```
+sudo apt-get install -y libsecp256k1-dev
+```
+
+If the wheel fails to build on your platform, fall back to conda:
+
+```
+conda create -n channel python=3.11
+conda activate channel
+conda install -c conda-forge secp256k1
+pip install -r requirements.txt
+```
+
+## Run tests
+
+```
+pytest -v
+mypy src/
+```
+
+Optional 9000-party scale test:
+
+```
+pytest -v -m slow
+```
+
+## CLI
+
+After install:
+
+```
+channel open --parties 4 --k 1000 --funded 1 --bond 1
+channel transfer --script transfers.json
+channel close
+channel contested
+```
+
+Use `--log-level DEBUG` to see structured logs.
+
+## Interpreter execution methodology (the hard rule)
+
+Every spend in the test suite is executed through the real Bitcoin Script
+interpreter exposed by `bitcoinx`:
+
+```python
+from bitcoinx import TxInputContext, InterpreterLimits, MinerPolicy
+limits = InterpreterLimits(policy, is_genesis_enabled=True, is_consensus=True)
+TxInputContext(tx, input_index, utxo).verify_input(limits, is_utxo_after_genesis=True)
+```
+
+Signature spot-checks (verifying a signature in Python rather than running the
+script through the VM) are **not** used as a substitute. Negative tests fail
+inside the interpreter, not in hand-written Python guards.
+
+## Layout
+
+See `docs/REPORT.md` for the full technical report (model, construction,
+proofs, security analysis, residual assumptions). See `docs/DECISIONS.md` for
+recorded design decisions.
+
+## Part II — standalone consumer-ready BSV system
+
+The package extends Part I (the channel reference implementation) with a
+fully self-contained BSV system, runnable on one machine with **zero
+external services**.
+
+Components:
+
+- `channel.node` — embedded BSV node: native P2P wire protocol
+  (`version`/`verack`, `ping`/`pong`, `inv`/`getdata`, `tx`, `block`,
+  `headers`/`getheaders`), header PoW chain with cumulative-work
+  longest-chain selection, SQLite-backed block/UTXO store, mempool with
+  conflict detection and original-protocol replacement, and an
+  `EmbeddedNode` regtest run mode that generates blocks locally.
+- `channel.wallet` — full HD wallet: BIP32-style derivation, encrypted
+  seed storage, UTXO tracking against the embedded node, coin selection,
+  fee-aware transaction construction, and high-level `pay_p2pkh`.
+- `channel.watchtower` — custody-free watchtower that **discharges the
+  liveness assumption** of Part I. Monitors the node's mempool, detects
+  superseded-state broadcasts, rebroadcasts the current state under the
+  replacement rule, and executes pre-signed bond forfeitures.
+- `channel.store` — durable system store (SQLite) for wallet seed,
+  channel states, bond records, and the tower registry.
+- `channel.runtime` — per-channel lock-based concurrency: many channels
+  in parallel; per-channel transfers serialised; closes use the latest
+  committed state.
+- `channel.fees` — per-byte fee model, whole-satoshi only.
+- `channel.obs` — structured logging, in-process metrics counters, health
+  snapshot.
+- `channel.daemon` — service daemon (TCP loopback, JSON line protocol)
+  hosting node + wallet + manager + tower.
+
+### Running the daemon
+
+```
+channel daemon-start --port 9000 --db /tmp/system.sqlite
+```
+
+The daemon listens on `127.0.0.1:<port>` (a local control surface only,
+not an external API). Issue commands from a separate process:
+
+```
+channel ping --port 9000
+channel status --port 9000
+channel node-generate --port 9000 --payout-hex <hex of pubkey>
+channel daemon-stop --port 9000
+```
+
+### Integration test transcript
+
+`pytest tests/test_integration.py -v -s` runs the full Phase 12
+end-to-end flow:
+
+```
+[1] init wallet
+[2] embedded regtest node up; tip = genesis at h=0
+[3] wallet funded; balance = 5000000000 satoshis at h=1
+[4] opened channel 1 (4 parties, k=10000, S=1)
+[5] applied 250 transfers on channel 1
+[6] routed payment over 3 hops; every hop settled (secret revealed)
+[7] cooperative close of channel 1; settled 5 sat (expected 5)
+[8] watchtower intervened on stale state and overtook it
+    watchtower forfeited bond of party 0 (1 sat)
+[9] conservation: channel 1 sum(Q*) = 1 == S = 1
+[10] simulating restart; recovered channel produced a verifying coop close
+Phase 12 — PASSED
+```
+
+Every spend in every step is verified through the real Bitcoin Script
+interpreter; no signature spot-checks substitute for VM execution.

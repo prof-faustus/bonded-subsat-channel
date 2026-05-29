@@ -1,0 +1,4 @@
+bitcoinX>=0.9
+pytest>=8
+hypothesis>=6
+mypy>=1.8

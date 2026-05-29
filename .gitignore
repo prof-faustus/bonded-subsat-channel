@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.mypy_cache/
+.pytest_cache/
+.hypothesis/
+.venv/
+build/
+dist/
+*.log
+.DS_Store
+
+# Local channel state files written by CLI smoke tests / manual runs.
+channel_state.json
+
+# Original build-prompt inputs and prior prototype scratch (not part of
+# the reference implementation).
+BUILD_PROMPT*.md
+README_code.md
+/channel.py
+/run_channel.py
