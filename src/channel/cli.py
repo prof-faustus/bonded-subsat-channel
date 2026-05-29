@@ -32,6 +32,7 @@ from .errors import ChannelError
 from .keymgmt import KeyBook
 from .lifecycle import Channel
 from .persistence import load_channel, save_channel
+from .safety import Mode, emit_banner_once, set_mode
 from .verify import verify_all_inputs, verify_spend
 
 
@@ -161,10 +162,30 @@ def cmd_node_generate(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="channel",
-                                 description="Bonded sub-satoshi channels (BSV).")
+    p = argparse.ArgumentParser(
+        prog="channel",
+        description=(
+            "Bonded sub-satoshi channels (BSV, post-Genesis). "
+            "RESEARCH CODE — regtest only by default. Mainnet is opt-in "
+            "via --mainnet + --i-understand-this-is-research-code."
+        ),
+    )
     p.add_argument("--log-level", default="INFO",
                    choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    p.add_argument(
+        "--mainnet", action="store_true",
+        help="opt-in to mainnet mode (also requires "
+             "--i-understand-this-is-research-code); off by default",
+    )
+    p.add_argument(
+        "--i-understand-this-is-research-code", action="store_true",
+        dest="confirmed",
+        help="required alongside --mainnet to acknowledge the risks",
+    )
+    p.add_argument(
+        "--no-banner", action="store_true",
+        help="suppress the standard research-code warning banner",
+    )
     sub = p.add_subparsers(dest="cmd", required=True)
 
     # Part I
@@ -226,6 +247,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         level=getattr(logging, args.log_level),
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
+
+    # Emit the research-code banner once, unless explicitly suppressed.
+    if not getattr(args, "no_banner", False):
+        emit_banner_once()
+
+    # Mainnet is opt-in and requires an explicit acknowledgement flag.
+    if getattr(args, "mainnet", False):
+        if not getattr(args, "confirmed", False):
+            print(
+                "error: --mainnet requires --i-understand-this-is-research-code",
+                file=sys.stderr,
+            )
+            return 2
+        set_mode(Mode.MAINNET, i_understand_this_is_research_code=True)
+
     try:
         return int(args.func(args))
     except ChannelError as e:

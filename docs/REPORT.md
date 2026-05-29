@@ -884,3 +884,37 @@ consensus single-spend / supersession rules — augmented in the
 implementation by the SIGHASH commitment that locks every multisig
 spend (channel close, bond return, bond forfeit) to the exact
 output structure it was signed for.
+
+### 10.8 Line-level cross-reference: proofs → tests → source
+
+The five §6 security properties each reduce to (a) interpreter
+acceptance of a signed spend, (b) interpreter rejection of an
+unsigned or tampered spend, and (c) the consensus single-spend /
+supersession rules. The mapping below names, for each property, the
+test that proves it through the interpreter **and** the source
+line(s) the test exercises. The single chokepoint for every spend
+is `src/channel/verify.py` (line 24, `verify_spend`).
+
+| Property | Test (file::name) | Source — primary | Source — supporting |
+|---|---|---|---|
+| Hard rule (every spend through VM) | `tests/test_scripts.py` (17 tests) | `src/channel/verify.py:24` (`verify_spend`) | `src/channel/verify.py:42` (`spend_verifies`) |
+| §3 — `Q*` well-defined, conserving | `tests/test_accounting.py::test_quantise_*` (4+1 tests, +hypothesis) | `src/channel/accounting.py:139` (`quantise`) | `src/channel/accounting.py:28` (`ensure_whole_satoshi`) |
+| §4.1 — n-of-n channel funding | `tests/test_scripts.py::test_channel_funding_positive`, `..._missing_one_signature`, `..._wrong_signer` | `src/channel/scripts.py:97` (`channel_funding_script`) | `src/channel/scripts.py:120` (`channel_funding_unlock`) |
+| §4.2 — hashlocked hop | `tests/test_scripts.py::test_hop_claim_branch_positive`, `..._with_wrong_preimage`, `..._return_branch_positive`, `..._return_signed_by_wrong_key` | `src/channel/scripts.py:145` (`hop_script`) | `src/channel/scripts.py:176,190` (unlock builders); **no in-script timelock opcode** |
+| §4.3 — P2PKH payout | `tests/test_scripts.py::test_p2pkh_positive`, `..._wrong_signer` | `src/channel/scripts.py:209` (`p2pkh_script`) | |
+| §4.4 — bond IF/ELSE | `tests/test_scripts.py::test_bond_return_branch_positive`, `..._return_signed_by_counterparty_fails`, `..._forfeit_branch_positive`, `..._forfeit_missing_one_counterparty` | `src/channel/scripts.py:224` (`bond_script`) | `src/channel/scripts.py:258,263` (unlock builders) |
+| §6.2 — **Property 1 — Balance security** | `tests/test_security.py::test_property1_balance_security`; `tests/test_lifecycle.py::test_superseded_state_does_not_become_settlement_and_bond_is_forfeit` | `src/channel/lifecycle.py:366` (`cooperative_close`); `src/channel/lifecycle.py:78` (`sequence_for_version`) | `src/channel/accounting.py:139` (`quantise`) |
+| §6.3 — **Property 2 — Atomicity** | `tests/test_security.py::test_property2_atomicity_secret_revealed_all_settle`, `..._not_revealed_all_return`; `tests/test_routing.py::test_secret_revealed_every_hop_settles`, `..._not_revealed_every_hop_returns` | `src/channel/routing.py:105` (`build_path`); `routing.py:225` (`settle_secret_revealed`); `routing.py:236` (`settle_secret_not_revealed`) | `routing.py:147`-`164` (`l*delta < L0` path bound, raised as `RoutingError`) |
+| §6.4 — **Property 3 — No theft in transit** | `tests/test_security.py::test_property3_no_theft_an_intermediary_cannot_skip_a_hop`; `tests/test_routing.py::test_intermediary_cannot_claim_without_preimage` | `src/channel/routing.py:178` (`build_claim_tx`) — preimage is pushed in script_sig, publishing `x` on claim | `src/channel/scripts.py:176` (`hop_claim_unlock`: `<sig> <preimage> OP_1`) |
+| §6.5 — **Property 4 — Bond soundness** | `tests/test_security.py::test_property4_bond_soundness_forfeit_branch_verifies`, `..._superseded_not_settlement`; `tests/test_lifecycle.py::test_superseded_state_does_not_become_settlement_and_bond_is_forfeit`; `tests/test_watchtower.py::test_tower_overtakes_stale_state_broadcast` | `src/channel/lifecycle.py:421` (`forfeit_bond_tx`); `src/channel/scripts.py:224` (`bond_script`) | `src/channel/lifecycle.py:78` (`sequence_for_version`); `src/channel/node/mempool.py:65`-`120` (replacement rule) |
+| §6.6 — **Property 5 — Conservation under adversary** | `tests/test_security.py::test_property5_conservation_under_adversary`; `tests/test_runtime.py::test_persistence_and_recovery_through_system_store`, `..._close_after_concurrent_transfers_verifies` | `src/channel/lifecycle.py:330` (`build_close_tx`); `src/channel/lifecycle.py:421` (`forfeit_bond_tx`) | `src/channel/accounting.py:82` (`State.conservation_check`); `src/channel/runtime/manager.py:46` (`apply_transfer` under per-channel lock) |
+| §6 — Negative cases rejected **inside** VM | `tests/test_negative.py` (12 tests, every one routed through `spend_verifies`) | `src/channel/verify.py:42` (`spend_verifies`) | all of §4 scripts |
+| §10 — Reorg-aware UTXO maintenance | `tests/test_node.py::test_reorg_depth_2_utxo_consistent` | `src/channel/node/network.py:200`-`280` (`_disconnect_block`, `_reorg_utxos`) | `src/channel/node/blockstore.py` |
+| §15 — Wallet-funded channel open (D11) | `tests/test_wallet_funded_channel.py::test_wallet_funded_channel_open_close_through_mempool` | `src/channel/wallet/builder.py:130` (`build_channel_funding_tx`); `src/channel/lifecycle.py:171` (`Channel.from_funding_tx`) | `src/channel/node/validation.py:25` (`validate_tx`) |
+| §17 — Script-enforced tower incentive (D14) | `tests/test_watchtower.py::test_tower_cannot_redirect_fee_to_itself_under_sighash_all`, `..._cannot_omit_fee_output_under_sighash_all`, `..._fee_paid_in_pre_signed_forfeit_verifies_through_VM`, `..._incentive_only_collected_on_intervention`, `..._no_intervention_no_fee` | `src/channel/lifecycle.py:421` (`forfeit_bond_tx` with `tower_pubkey`/`tower_fee`) | `src/channel/signing.py:24` (`sign_input` under `SIGHASH_ALL` \| `FORKID`) |
+| §17 (hardened) — k-of-k-independent watcher cluster | `tests/test_watchcluster.py` (7 tests; in particular `test_cluster_defends_when_only_one_watcher_online`, `test_cluster_only_one_forfeit_confirms_via_single_spend`, `test_cluster_zero_defence_when_all_watchers_offline`) | `src/channel/watchtower/cluster.py` (`WatchCluster`, `WatcherSpec`) | `src/channel/watchtower/tower.py` |
+
+Note: line numbers refer to commit `30d0428` and successors on
+`main`. The `grep` recipe in `docs/AUDIT.md` §7 (#4 and #5) lets an
+independent reviewer re-derive the chokepoint and the absence of
+in-script timelock opcodes mechanically.

@@ -1,0 +1,13 @@
+.git
+.github
+__pycache__
+*.pyc
+.mypy_cache
+.pytest_cache
+.hypothesis
+.coverage
+htmlcov
+build
+dist
+*.zip
+docs/PHASE12_TRANSCRIPT.txt
