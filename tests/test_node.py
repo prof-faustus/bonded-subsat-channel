@@ -228,18 +228,18 @@ def test_node_accepts_higher_sequence_replacement() -> None:
 
 
 def test_node_reorg_depth_2_handled() -> None:
-    """Build a fork that overtakes the active chain by cumulative work."""
+    """Build a fork that overtakes the active chain by cumulative work.
+
+    Header-only variant (UTXO consistency is verified by the next test).
+    """
     node = EmbeddedNode()
     priv = PrivateKey.from_random()
     payout = p2pkh_script(priv.public_key)
-    # Active chain: 3 blocks.
     h1, _ = node.generate_block(payout)
     h2, _ = node.generate_block(payout)
     h3, _ = node.generate_block(payout)
     assert node.height() == 3
 
-    # Build a fork off h1: each fork header is mined under regtest bits so
-    # the PoW check passes (regtest bits make this essentially free).
     target = bits_to_target(REGTEST_BITS)
     fork_parent = h1
     fork_chain: list[bytes] = []
@@ -260,6 +260,95 @@ def test_node_reorg_depth_2_handled() -> None:
         node.headers.connect(rh)
         fork_parent = header_hash(rh)
         fork_chain.append(fork_parent)
-    # Reorg to the longer fork (3 headers off h1 vs 2 off h1 on the active chain).
     assert node.headers.height() == 4
     assert node.headers.tip_hash == fork_chain[-1]
+
+
+# ---------------------------------------------------------------------------
+# G2 — Reorg-depth-2 with UTXO consistency
+# ---------------------------------------------------------------------------
+
+
+def _mine_block_off(node: EmbeddedNode, prev_hash: bytes,
+                     payout_script: Script, timestamp: int,
+                     ) -> tuple[bytes, bytes, list[Tx]]:
+    """Mine a fully-formed regtest block whose parent is ``prev_hash``.
+
+    Does **not** connect the header or apply UTXO changes — the caller
+    feeds the result to :meth:`EmbeddedNode.accept_block`. Returns
+    ``(raw_header, block_hash, txs)``; the block contains only its
+    coinbase, sufficient for the UTXO-consistency assertion.
+    """
+    from channel.node.network import make_coinbase
+    parent = node.headers.lookup(prev_hash)
+    assert parent is not None, f"unknown parent {prev_hash[::-1].hex()}"
+    height = parent.height + 1
+    coinbase = make_coinbase(node.coinbase_reward, payout_script, height,
+                              extra=timestamp.to_bytes(4, "little"))
+    txs = [coinbase]
+    root = merkle_root([tx.hash() for tx in txs])
+    target = bits_to_target(REGTEST_BITS)
+    nonce = 0
+    while True:
+        rh = build_raw_header(REGTEST_VERSION, prev_hash, root, timestamp,
+                               REGTEST_BITS, nonce)
+        if hash_to_int(header_hash(rh)) <= target:
+            break
+        nonce += 1
+    return rh, header_hash(rh), txs
+
+
+def test_reorg_depth_2_utxo_consistent() -> None:
+    """G2. After a depth-2 reorg the UTXO set matches the heavier chain.
+
+    Scenario:
+        genesis -> A1 (coinbase to alice)         <- old tip
+        genesis -> B1 -> B2 (coinbases to bob)    <- heavier; wins
+
+    After ingesting the heavier chain the node's UTXO set must contain
+    B1 and B2's coinbase outputs and must **not** contain A1's coinbase
+    output — i.e. exactly what a fresh ingest of the heavier chain alone
+    would produce.
+    """
+    node = EmbeddedNode()
+    alice = PrivateKey.from_random()
+    bob = PrivateKey.from_random()
+    alice_script = p2pkh_script(alice.public_key)
+    bob_script = p2pkh_script(bob.public_key)
+
+    # Active chain: A1 mined to alice.
+    a1_hash, a1_txs = node.generate_block(alice_script)
+    a1_coinbase = a1_txs[0]
+    assert node.height() == 1
+    assert node.blockstore.get_utxo(a1_coinbase.hash(), 0) is not None
+
+    # Mine a fork: B1 off genesis (equal-work sibling of A1).
+    b1_header, b1_hash, b1_txs = _mine_block_off(
+        node, node.genesis_hash(), bob_script, timestamp=2_000_000_000,
+    )
+    node.accept_block(b1_header, b1_txs)
+    # Equal work: active chain unchanged.
+    assert node.headers.tip_hash == a1_hash
+    # Heavier extension: B2 off B1.
+    b2_header, b2_hash, b2_txs = _mine_block_off(
+        node, b1_hash, bob_script, timestamp=2_000_000_010,
+    )
+    node.accept_block(b2_header, b2_txs)
+
+    # Reorg: tip is now B2.
+    assert node.headers.tip_hash == b2_hash
+    assert node.headers.height() == 2
+
+    # UTXO consistency invariants:
+    # 1. A1's coinbase output has been disconnected.
+    assert node.blockstore.get_utxo(a1_coinbase.hash(), 0) is None
+    # 2. B1 and B2's coinbases are present, paying bob.
+    b1_entry = node.blockstore.get_utxo(b1_txs[0].hash(), 0)
+    b2_entry = node.blockstore.get_utxo(b2_txs[0].hash(), 0)
+    assert b1_entry is not None and b1_entry.value == node.coinbase_reward
+    assert b2_entry is not None and b2_entry.value == node.coinbase_reward
+    # 3. The UTXO set matches a fresh ingest of the heavier chain alone.
+    fresh = EmbeddedNode()
+    fresh.accept_block(b1_header, b1_txs)
+    fresh.accept_block(b2_header, b2_txs)
+    assert fresh.blockstore.utxo_count() == node.blockstore.utxo_count()

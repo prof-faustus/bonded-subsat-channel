@@ -25,6 +25,7 @@ from channel.keymgmt import KeyBook  # noqa: E402
 from channel.lifecycle import Channel  # noqa: E402
 from channel.node.network import EmbeddedNode  # noqa: E402
 from channel.watchtower.incentive import IncentiveLedger  # noqa: E402
+from channel.watchtower.monitor import Monitor  # noqa: E402
 from channel.watchtower.registry import Registry, WatchRecord  # noqa: E402
 from channel.watchtower.tower import Tower  # noqa: E402
 from channel.verify import verify_spend  # noqa: E402
@@ -152,3 +153,49 @@ def test_incentive_caps_fee_at_bond() -> None:
     assert ledger.record(bond_value=10) == 5
     assert ledger.record(bond_value=2) == 2  # capped
     assert ledger.total() == 7
+
+
+# ---------------------------------------------------------------------------
+# G1 — Monitor periodic-tick loop
+# ---------------------------------------------------------------------------
+
+
+def test_monitor_loop_emits_ticks() -> None:
+    """Monitor start/run/stop lifecycle increments an observable tick counter.
+
+    Uses a short interval (50 ms) so the test exercises at least two
+    ticks within a deterministic window without sleeping the suite.
+    """
+    import time as _time
+
+    node = EmbeddedNode()
+    reg = Registry()
+    tower = Tower(node=node, registry=reg)
+    mon = Monitor(tower=tower, interval_s=0.05)
+
+    assert not mon.is_running()
+    mon.start()
+    try:
+        assert mon.is_running()
+        # Wait until at least two ticks land, but cap the wait so a stuck
+        # monitor fails fast rather than blocking the suite.
+        deadline = _time.monotonic() + 1.5
+        while mon.ticks < 2 and _time.monotonic() < deadline:
+            _time.sleep(0.02)
+        assert mon.ticks >= 2, f"monitor only ticked {mon.ticks} times in 1.5s"
+    finally:
+        mon.stop()
+    assert not mon.is_running()
+
+
+def test_monitor_idempotent_start_and_stop() -> None:
+    """Double start/stop must be safe and not leak threads."""
+    node = EmbeddedNode()
+    tower = Tower(node=node, registry=Registry())
+    mon = Monitor(tower=tower, interval_s=0.05)
+    mon.start()
+    mon.start()  # second start is a no-op while the thread is alive
+    assert mon.is_running()
+    mon.stop()
+    mon.stop()  # safe to stop again
+    assert not mon.is_running()

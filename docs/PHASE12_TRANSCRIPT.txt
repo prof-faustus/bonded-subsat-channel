@@ -1,0 +1,19 @@
+======================================================================
+Phase 12 — full-system integration on regtest
+======================================================================
+[1] init wallet (seed = 706861736531325f696e746567726174...)
+[2] embedded regtest node up; tip = genesis at h=0
+[3] wallet funded; balance = 5000000000 satoshis at h=1
+[4] opened channel 1 (4 parties, k=10000, S=1); cid=b005b77a48d8c24c...
+[5] applied 250 transfers on channel 1; new version = 250
+[6] routed payment over 3 hops; every hop settled (secret revealed)
+[7] cooperative close of channel 1; settled 5 sat (expected 5)
+[8] watchtower intervened on stale state and overtook it
+     watchtower forfeited bond of party 0 (1 sat)
+[9] conservation: channel 1 sum(Q*) = 1 == S = 1
+[10] simulating restart; cid1 version before = 250
+     recovered cid1 with version 250, balances match: True
+     recovered channel produced a verifying cooperative close
+======================================================================
+Phase 12 — PASSED
+======================================================================

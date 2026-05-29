@@ -236,3 +236,13 @@ def test_phase12_full_system_integration(capsys: pytest.CaptureFixture) -> None:
 
     # Assert the transcript was produced.
     assert any("Phase 12 — PASSED" in line for line in transcript)
+
+    # G10: write the transcript to docs/PHASE12_TRANSCRIPT.txt unconditionally
+    # (independent of pytest -s) so a reviewer can inspect it without
+    # re-running the test. The file is overwritten on each run so it
+    # always reflects the latest pass.
+    repo_root = os.path.abspath(os.path.join(_HERE, ".."))
+    out_path = os.path.join(repo_root, "docs", "PHASE12_TRANSCRIPT.txt")
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(transcript) + "\n")

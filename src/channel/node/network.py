@@ -20,7 +20,7 @@ from typing import Callable, Optional, Sequence
 
 from bitcoinx import Ops, Script, Tx, TxInput, TxOutput
 
-from .block import merkle_root, serialise_block
+from .block import merkle_root, parse_block, serialise_block
 from .blockstore import BlockStore, UtxoEntry
 from .headers import HeaderError, HeaderStore, bits_to_target, build_raw_header, header_hash, hash_to_int
 from .mempool import Mempool
@@ -107,6 +107,15 @@ class EmbeddedNode:
     network peers; all transactions enter via :meth:`submit_tx` and all
     blocks via :meth:`generate_block` (in regtest) or
     :meth:`accept_block` (when fed externally).
+
+    Reorg handling. Each connected block records, in :attr:`undo_log`,
+    the UTXOs it consumed (so they can be re-added on disconnect). When
+    :meth:`accept_block` connects a header that shifts the longest chain
+    onto a fork, the node first disconnects blocks back to the common
+    ancestor (replaying the undo log in reverse) and then connects each
+    block of the new chain in order. The UTXO set after the reorg is
+    therefore exactly what a fresh ingest of the heavier chain would
+    produce, which is the invariant the spec calls for.
     """
 
     network_magic: bytes = b"\xDA\xB5\xBF\xFA"  # BSV regtest magic
@@ -115,6 +124,12 @@ class EmbeddedNode:
     mempool: Mempool = field(init=False)
     genesis: bytes = field(init=False)
     coinbase_reward: int = 50_00_000_000  # 50 BSV in satoshis (regtest)
+    # block_hash -> list of (txid, vout, value, script, height) entries
+    # for outputs spent when this block was connected.
+    undo_log: dict[bytes, list[tuple[bytes, int, int, bytes, int]]] = field(default_factory=dict)
+    # block_hash -> list of (txid, vout) entries created by the block,
+    # so a disconnect can remove them precisely (covers coinbase too).
+    created_log: dict[bytes, list[tuple[bytes, int]]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.genesis = make_regtest_genesis()
@@ -185,9 +200,9 @@ class EmbeddedNode:
                 raise RuntimeError("regtest mine: nonce exhausted (shouldn't happen)")
         # Connect header.
         self.headers.connect(raw_header)
-        # Apply to blockstore.
+        # Apply to blockstore (records undo data).
         self.blockstore.store_block(h, height, serialise_block(raw_header, txs))
-        self.blockstore.connect_block_utxos(height, txs)
+        self._connect_block_with_undo(h, height, txs)
         # Evict mined transactions from mempool.
         for tx in included:
             self.mempool.evict(tx.hash())
@@ -195,14 +210,118 @@ class EmbeddedNode:
         return h, txs
 
     def accept_block(self, raw_header: bytes, txs: list[Tx]) -> None:
-        """Accept an externally-supplied (e.g. peer-relayed) block."""
+        """Accept an externally-supplied block; reorg the UTXO set if needed."""
+        prev_tip = self.headers.tip_hash
         self.headers.connect(raw_header)
-        height = self.headers.lookup(header_hash(raw_header)).height  # type: ignore[union-attr]
         h = header_hash(raw_header)
+        new_tip = self.headers.tip_hash
+        height = self.headers.lookup(h).height  # type: ignore[union-attr]
         self.blockstore.store_block(h, height, serialise_block(raw_header, txs))
-        self.blockstore.connect_block_utxos(height, txs)
+        if new_tip == h and prev_tip != self.headers.lookup(h).prev_hash:  # type: ignore[union-attr]
+            # The new block extended a fork that has overtaken the active
+            # chain. Reorganise the UTXO set onto the new chain.
+            self._reorg_utxos(from_tip=prev_tip, to_tip=new_tip)
+        elif new_tip == h:
+            # Direct extension of the active chain.
+            self._connect_block_with_undo(h, height, txs)
+            for tx in txs:
+                self.mempool.evict(tx.hash())
+        # Otherwise the new block is on a stale fork; headers store it
+        # but we don't touch the UTXO set.
+
+    # ------------------------------------------------------------------ #
+    # Reorg machinery
+    # ------------------------------------------------------------------ #
+
+    def _connect_block_with_undo(self, block_hash: bytes, height: int,
+                                  txs: list[Tx]) -> None:
+        """Apply a block to the UTXO set; record undo data."""
+        undo: list[tuple[bytes, int, int, bytes, int]] = []
+        created: list[tuple[bytes, int]] = []
         for tx in txs:
-            self.mempool.evict(tx.hash())
+            txid = tx.hash()
+            if not tx.is_coinbase():
+                for tin in tx.inputs:
+                    entry = self.blockstore.get_utxo(bytes(tin.prev_hash), int(tin.prev_idx))
+                    if entry is not None:
+                        undo.append((entry.txid, entry.vout, entry.value,
+                                     entry.script_pubkey, entry.height))
+            for i in range(len(tx.outputs)):
+                created.append((txid, i))
+        self.blockstore.connect_block_utxos(height, txs)
+        self.undo_log[block_hash] = undo
+        self.created_log[block_hash] = created
+
+    def _disconnect_block(self, block_hash: bytes) -> None:
+        """Reverse a block's effect on the UTXO set using the undo log."""
+        # Remove outputs the block created.
+        for txid, vout in self.created_log.get(block_hash, []):
+            existing = self.blockstore.get_utxo(txid, vout)
+            if existing is not None:
+                # spend_utxo removes the entry.
+                self.blockstore.spend_utxo(txid, vout)
+        # Re-add inputs the block had consumed.
+        for txid, vout, value, script, h in self.undo_log.get(block_hash, []):
+            self.blockstore.add_utxo(UtxoEntry(
+                txid=txid, vout=vout, value=value,
+                script_pubkey=script, height=h,
+            ))
+        # Forget the undo data; the block is no longer connected.
+        self.undo_log.pop(block_hash, None)
+        self.created_log.pop(block_hash, None)
+
+    def _reorg_utxos(self, from_tip: bytes, to_tip: bytes) -> None:
+        """Disconnect blocks back to common ancestor; connect the new chain."""
+        # Walk back from each tip until the chains meet.
+        def path_to(h: bytes) -> list[bytes]:
+            out: list[bytes] = []
+            cur = self.headers.lookup(h)
+            while cur is not None and cur.height > 0:
+                out.append(cur.hash)
+                cur = self.headers.lookup(cur.prev_hash)
+            out.append(self.headers.lookup(self.genesis_hash()).hash)  # type: ignore[union-attr]
+            return out
+
+        old_path = path_to(from_tip)
+        new_path = path_to(to_tip)
+        old_set = set(old_path)
+        # Find the first shared ancestor on the new path.
+        ancestor: Optional[bytes] = None
+        for h in new_path:
+            if h in old_set:
+                ancestor = h
+                break
+        if ancestor is None:
+            raise RuntimeError("reorg: no common ancestor (corrupt header chain)")
+        # Disconnect from old_tip back to (but not including) ancestor.
+        for h in old_path:
+            if h == ancestor:
+                break
+            self._disconnect_block(h)
+        # Connect from ancestor (exclusive) up to new_tip in order.
+        new_chain_to_connect = []
+        for h in new_path:
+            if h == ancestor:
+                break
+            new_chain_to_connect.append(h)
+        new_chain_to_connect.reverse()
+        for h in new_chain_to_connect:
+            raw_block = self.blockstore.get_block(h)
+            if raw_block is None:
+                raise RuntimeError(
+                    f"reorg: block {h[::-1].hex()} not in blockstore"
+                )
+            _hdr, txs = parse_block(raw_block)
+            height_h = self.headers.lookup(h).height  # type: ignore[union-attr]
+            self._connect_block_with_undo(h, height_h, txs)
+            for tx in txs:
+                self.mempool.evict(tx.hash())
+        _log.info("reorg: disconnected %d blocks, connected %d blocks",
+                   len(old_path) - new_path.index(ancestor),
+                   len(new_chain_to_connect))
+
+    def genesis_hash(self) -> bytes:
+        return header_hash(self.genesis)
 
 
 __all__ = [

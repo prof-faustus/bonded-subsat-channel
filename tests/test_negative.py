@@ -66,6 +66,28 @@ def test_funding_close_missing_one_of_n_signatures_rejected_by_VM() -> None:
     assert not spend_verifies(tx, 0, utxo)
 
 
+def test_funding_close_one_wrong_signer_rejected_by_VM() -> None:
+    """G7. n-1 honest sigs + one DER-valid sig from a non-participant key.
+
+    The sharper variant of the missing-signature test: instead of a zero
+    placeholder for the n-th signature, we supply a fully well-formed
+    signature whose only fault is that the signing key is **not** one of
+    the n participants. This forces the interpreter to reject for the
+    "wrong key" reason rather than for "not a DER signature".
+    """
+    privs = _keys(40_500, 4)
+    impostor = _keys(40_999, 1)[0]
+    pubs = [p.public_key for p in privs]
+    locking = channel_funding_script(pubs)
+    tx, utxo = _build_spend(locking, utxo_value=10_000)
+
+    # First 3 of 4 honest sigs; 4th is a DER-valid sig from an outsider.
+    sigs = [sign_input(tx, 0, utxo.value, locking, p) for p in privs[:3]]
+    impostor_sig = sign_input(tx, 0, utxo.value, locking, impostor)
+    _set_sig(tx, channel_funding_unlock(sigs + [impostor_sig]))
+    assert not spend_verifies(tx, 0, utxo)
+
+
 # ---------------------------------------------------------------------------
 # §10 case 2: bond forfeiture with only m-1 of m counterparty signatures
 # ---------------------------------------------------------------------------

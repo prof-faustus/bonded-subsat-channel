@@ -798,4 +798,72 @@ wallet's view, perform 250 transfers, route a payment across a
 multi-hop hashlocked path, cooperatively close, open a second channel
 and contested-close it defended by a watchtower, assert conservation,
 and clean-restart with full state recovery. Every spend in every step
-is verified through the real Bitcoin Script interpreter.
+is verified through the real Bitcoin Script interpreter. The
+transcript is written to `docs/PHASE12_TRANSCRIPT.txt` on every test
+run (independent of `pytest -s`) so reviewers can inspect it without
+re-running the suite.
+
+### 10.7 Audit-driven gap closures and residual scope
+
+A pre-submission audit identified ten candidate gaps; each was either
+closed by additional tests, by an implementation extension, or by an
+explicit scoping decision recorded in `docs/DECISIONS.md`.
+
+- **G1 — Monitor loop test (closed by tests).** The watchtower's
+  periodic-tick loop (`watchtower/monitor.py`) is exercised by
+  `test_monitor_loop_emits_ticks` and
+  `test_monitor_idempotent_start_and_stop`, which verify the lifecycle
+  (start → tick observation → clean stop) and start/stop idempotency.
+- **G2 — Reorg-depth-2 with UTXO consistency (closed by extension +
+  test).** `EmbeddedNode` now records a per-block undo log and performs
+  reorg-aware UTXO maintenance in `accept_block`. The invariant —
+  "the UTXO set after the reorg is exactly what a fresh ingest of the
+  heavier chain alone would produce" — is asserted by
+  `test_reorg_depth_2_utxo_consistent`, which mines `A1` on one chain
+  and `B1 → B2` on a heavier sibling and compares the resulting UTXO
+  count to a fresh-ingest baseline.
+- **G3 — P2P wire-protocol error paths (closed by tests).**
+  `tests/test_p2p.py` adds 14 negative tests covering bad magic, bad
+  checksum, oversized length, truncated header and truncated payload,
+  varint EOF and short 8-byte form, `var_bytes` cap enforcement,
+  malformed `getheaders` / `headers` / `inv` / `ping` payloads, and the
+  stateful invariant that one bad frame does not corrupt subsequent
+  parses.
+- **G4 — CLI subprocess tests (closed by tests).** `tests/test_cli.py`
+  drives each CLI subcommand via the `python -m channel.cli` entry
+  point and asserts exit codes and key output strings for `open`,
+  `transfer`, `close`, `contested`, the missing-state and
+  malformed-script error paths, the no-subcommand help path, and the
+  global `--log-level` flag.
+- **G5 — Phase 12 funding scoping (closed by decision D11).** The
+  channel funding outputs are installed directly into the node's UTXO
+  set rather than spent in from wallet UTXOs; the spec property is
+  unchanged. See DECISIONS.md D11.
+- **G6 — Scale-test scope claims (closed by decision D12).** Three
+  scale tests at three precise fidelity levels; the paper's scale
+  claim is restated as: VM-verified to n = 200,
+  accounting-verified to n = 9000. See DECISIONS.md D12.
+- **G7 — DER-valid wrong-signer funding test (closed by test).**
+  `test_funding_close_one_wrong_signer_rejected_by_VM` supplies a
+  DER-valid signature from a non-participant key (rather than a zero
+  placeholder) and asserts the interpreter rejects on the wrong-key
+  ground rather than the malformed-signature ground.
+- **G8 — Watchtower incentive placeholder (closed by decision D14).**
+  The tower's incentive-compatibility is an off-chain accounting
+  commitment in the current implementation. The scoped paper claim is
+  the tower's non-reliance for *soundness* (custody-free, D9); a
+  script-enforced tower payment is a future Part II refinement. See
+  DECISIONS.md D14.
+- **G9 — KDF cost factor (closed by extension + decision D13).**
+  PBKDF2-HMAC-SHA256 iteration count raised from 200 000 to 600 000 to
+  match OWASP 2023 guidance for SHA-256 password storage. See
+  DECISIONS.md D13.
+- **G10 — Phase 12 transcript file (closed by test extension).**
+  `tests/test_integration.py` writes the full transcript to
+  `docs/PHASE12_TRANSCRIPT.txt` on every run, independent of `pytest
+  -s`.
+
+The residuals after this pass are exactly the two documented design
+decisions (D11 wallet-funded parent and D14 script-enforced tower
+payment). Neither invalidates the construction; both are scoped
+extensions for future work.

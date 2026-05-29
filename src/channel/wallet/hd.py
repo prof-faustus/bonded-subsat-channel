@@ -37,7 +37,13 @@ class WalletError(ChannelError):
 # ---------------------------------------------------------------------------
 
 
-_KDF_ITERS = 200_000
+# PBKDF2-HMAC-SHA256 iteration count. OWASP's 2023 password-storage
+# cheat sheet recommends >= 600_000 for SHA-256; we set 600_000 here so
+# the at-rest seed encryption is calibrated to current guidance. The
+# cost is a few hundred milliseconds at decrypt time on a modern laptop,
+# which is acceptable for an interactive wallet-unlock step. See
+# DECISIONS.md D13.
+_KDF_ITERS = 600_000
 _NONCE_LEN = 16
 
 
