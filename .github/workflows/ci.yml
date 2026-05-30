@@ -34,9 +34,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libsecp256k1-dev
 
-      - name: Install libsecp256k1 (macOS)
+      - name: Install libsecp256k1 + autotools (macOS)
         if: runner.os == 'macOS'
-        run: brew install secp256k1
+        run: |
+          # autoconf/automake/libtool are required because the
+          # electrumsv-secp256k1 sdist bootstraps with autogen.sh when
+          # no matching binary wheel exists for the runner's Python.
+          brew install secp256k1 autoconf automake libtool
 
       - name: Install Python dependencies
         run: |
