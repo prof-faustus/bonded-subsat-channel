@@ -97,19 +97,42 @@ Signature spot-checks (verifying a signature in Python rather than running the
 script through the VM) are **not** used as a substitute. Negative tests fail
 inside the interpreter, not in hand-written Python guards.
 
-## One-command demo
+## One-command quickstart
 
 ```bash
-./demo.sh           # uses the host Python
-./demo.sh docker    # builds and runs the Docker image
+./scripts/quickstart.sh              # full flow: venv + tests + tiny-transfers + Phase 12
+./scripts/quickstart.sh --with-docker # also build + run the Docker image
+./scripts/quickstart.sh --cleanup    # remove the venv + Docker image
 ```
 
-Both print the Phase 12 end-to-end transcript on stdout (target: < 60 s).
+On Windows / PowerShell:
+
+```powershell
+.\scripts\quickstart.ps1
+.\scripts\quickstart.ps1 -WithDocker
+.\scripts\quickstart.ps1 -Cleanup
+```
+
+The full flow (without Docker) takes about **30 s** on a modern host.
+It creates a `.venv-quickstart/` venv, runs the test suite + mypy +
+bandit, runs the tiny-transfers demo (sub-satoshi off-chain, integer
+on-chain), and prints the Phase 12 end-to-end transcript.
+
+See **[docs/QUICKSTART.md](docs/QUICKSTART.md)** for the full
+step-by-step walkthrough.
+
+### Just the demo
+
+```bash
+python scripts/tiny_transfers_demo.py                            # default: n=4, k=1000, 200 transfers
+python scripts/tiny_transfers_demo.py --k 1000000 --transfers 1000 # finer granularity
+```
 
 ## Documentation
 
 | File | Purpose |
 |---|---|
+| `docs/QUICKSTART.md` | Step-by-step walkthrough for the quickstart scripts |
 | `docs/REPORT.md` | Full technical report with proofs and §10.8 line-level proof→test→source map |
 | `docs/AUDIT.md` | Audit findings (G1–G10 + P1–P7 + L) and their resolution |
 | `docs/DECISIONS.md` | Recorded design decisions (D1–D14) |
